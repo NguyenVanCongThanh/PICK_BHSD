@@ -20,9 +20,9 @@ def context_mask(img, mask_ratio):
     loss_mask = torch.ones(batch_size, img_x, img_y, img_z).cuda()
     mask = torch.ones(img_x, img_y, img_z).cuda()
     patch_pixel_x, patch_pixel_y, patch_pixel_z = int(img_x*mask_ratio), int(img_y*mask_ratio), int(img_z*mask_ratio)
-    w = np.random.randint(0, 112 - patch_pixel_x)
-    h = np.random.randint(0, 112 - patch_pixel_y)
-    z = np.random.randint(0, 80 - patch_pixel_z)
+    w = np.random.randint(0, max(img_x - patch_pixel_x, 1))
+    h = np.random.randint(0, max(img_y - patch_pixel_y, 1))
+    z = np.random.randint(0, max(img_z - patch_pixel_z, 1))
     mask[w:w+patch_pixel_x, h:h+patch_pixel_y, z:z+patch_pixel_z] = 0
     loss_mask[:, w:w+patch_pixel_x, h:h+patch_pixel_y, z:z+patch_pixel_z] = 0
     return mask.long(), loss_mask.long()
@@ -55,22 +55,24 @@ def concate_mask(img):
     loss_mask[:, :, :, z:z+z_length] = 0
     return mask.long(), loss_mask.long()
 
-def mix_loss(net3_output, img_l, patch_l, mask, l_weight=1.0, u_weight=0.5, unlab=False):
+def mix_loss(net3_output, img_l, patch_l, mask, l_weight=1.0, u_weight=0.5, unlab=False, dice_fn=None):
     img_l, patch_l = img_l.type(torch.int64), patch_l.type(torch.int64)
     image_weight, patch_weight = l_weight, u_weight
     if unlab:
         image_weight, patch_weight = u_weight, l_weight
     patch_mask = 1 - mask
-    dice_loss = DICE(net3_output, img_l, mask) * image_weight 
-    dice_loss += DICE(net3_output, patch_l, patch_mask) * patch_weight
+    dice_loss_calc = dice_fn if dice_fn is not None else DICE
+    dice_loss = dice_loss_calc(net3_output, img_l, mask) * image_weight 
+    dice_loss += dice_loss_calc(net3_output, patch_l, patch_mask) * patch_weight
     loss_ce = image_weight * (CE(net3_output, img_l) * mask).sum() / (mask.sum() + 1e-16) 
     loss_ce += patch_weight * (CE(net3_output, patch_l) * patch_mask).sum() / (patch_mask.sum() + 1e-16)
     loss = (dice_loss + loss_ce) / 2
     return loss
 
-def sup_loss(output, label):
+def sup_loss(output, label, dice_fn=None):
     label = label.type(torch.int64)
-    dice_loss = DICE(output, label)
+    dice_loss_calc = dice_fn if dice_fn is not None else DICE
+    dice_loss = dice_loss_calc(output, label)
     loss_ce = torch.mean(CE(output, label))
     loss = (dice_loss + loss_ce) / 2
     return loss

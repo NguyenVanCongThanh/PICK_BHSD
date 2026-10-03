@@ -1,0 +1,395 @@
+import os
+import sys
+import shutil
+import argparse
+import logging
+import random
+import numpy as np
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import torch
+import torch.optim as optim
+from torchvision import transforms
+import torch.nn.functional as F
+import torch.backends.cudnn as cudnn
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from dataloaders.dataset_bhsd import BHSDDataset, RandomRotFlip, RandomCrop, ToTensor
+from dataloaders.dataset import TwoStreamBatchSampler
+from networks.net_factory import net_factory
+from utils import losses, ramps
+from utils.BCP_utils import context_mask, update_ema_variables
+from test_util import calculate_metric_percase
+
+parser = argparse.ArgumentParser(description="PICK Training for BHSD Binary Segmentation")
+parser.add_argument('--root_path', type=str, default='/home/u001015/dataset/BHSD_h5/', help='Root directory of BHSD H5 dataset')
+parser.add_argument('--exp', type=str, default='BHSD_binary_PICK', help='Experiment name')
+parser.add_argument('--model', type=str, default='VNet', help='Model architecture')
+parser.add_argument('--pre_max_iteration', type=int, default=4000, help='Maximum pre-train iterations')
+parser.add_argument('--self_max_iteration', type=int, default=12000, help='Maximum self-train iterations')
+parser.add_argument('--max_samples', type=int, default=150, help='Total training samples pool')
+parser.add_argument('--labeled_bs', type=int, default=2, help='Batch size for labeled samples')
+parser.add_argument('--batch_size', type=int, default=4, help='Total batch size (labeled + unlabeled)')
+parser.add_argument('--base_lr', type=float, default=0.01, help='Initial learning rate')
+parser.add_argument('--deterministic', type=int, default=1, help='Whether to use deterministic training')
+parser.add_argument('--labelnum', type=int, default=15, help='Number of labeled samples (~10% or ~20%)')
+parser.add_argument('--gpu', type=str, default='0', help='GPU ID to use')
+parser.add_argument('--seed', type=int, default=1337, help='Random seed')
+parser.add_argument('--consistency', type=float, default=1.0, help='Consistency loss weight')
+parser.add_argument('--consistency_rampup', type=float, default=40.0, help='Consistency ramp-up epochs')
+parser.add_argument('--lambda_', type=float, default=0.2, help='MIM loss balance weight')
+parser.add_argument('--mask_ratio', type=float, default=2/3, help='Mask ratio for CutMix and context masking')
+parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3, 4], help='Fold index for 5-fold cross-validation')
+parser.add_argument('--exp_dir', type=str, default='../experiments', help='Base directory to save experiments')
+args = parser.parse_args()
+
+os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+if args.deterministic:
+    cudnn.benchmark = False
+    cudnn.deterministic = True
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+patch_size = (32, 160, 160)
+num_classes = 2  # 0: Background, 1: Hemorrhage
+
+
+def save_net_opt(net, optimizer, path):
+    state = {'net': net.state_dict(), 'opt': optimizer.state_dict()}
+    torch.save(state, str(path))
+
+
+def load_net(net, path):
+    state = torch.load(str(path))
+    net.load_state_dict(state['net'])
+
+
+def get_current_consistency_weight(epoch):
+    return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
+
+
+def validate(model, val_dataset, patch_size=(32, 160, 160), stride_z=8, stride_xy=32):
+    """Sliding-window 3D inference for binary validation."""
+    model.eval()
+    dices = []
+    
+    with torch.no_grad():
+        for i in range(len(val_dataset)):
+            sample, _ = val_dataset[i]
+            image, label = sample['image'], sample['label']
+            z, y, x = image.shape
+            
+            # Pad if smaller than patch
+            pz = max(patch_size[0] - z, 0)
+            py = max(patch_size[1] - y, 0)
+            px = max(patch_size[2] - x, 0)
+            if pz > 0 or py > 0 or px > 0:
+                image = np.pad(image, [(0, pz), (0, py), (0, px)], mode='constant', constant_values=0)
+            
+            w_z, w_y, w_x = image.shape
+            sz = max(int(np.ceil((w_z - patch_size[0]) / stride_z)) + 1, 1)
+            sy = max(int(np.ceil((w_y - patch_size[1]) / stride_xy)) + 1, 1)
+            sx = max(int(np.ceil((w_x - patch_size[2]) / stride_xy)) + 1, 1)
+            
+            score_map = np.zeros((num_classes, w_z, w_y, w_x), dtype=np.float32)
+            cnt = np.zeros((w_z, w_y, w_x), dtype=np.float32)
+            
+            for iz in range(sz):
+                zs = min(iz * stride_z, w_z - patch_size[0])
+                for iy in range(sy):
+                    ys = min(iy * stride_xy, w_y - patch_size[1])
+                    for ix in range(sx):
+                        xs = min(ix * stride_xy, w_x - patch_size[2])
+                        
+                        patch = image[zs:zs + patch_size[0], ys:ys + patch_size[1], xs:xs + patch_size[2]]
+                        patch_tensor = torch.from_numpy(patch).unsqueeze(0).unsqueeze(0).cuda().float()
+                        
+                        _, out, _ = model(patch_tensor)
+                        prob = F.softmax(out, dim=1).squeeze(0).cpu().numpy()
+                        
+                        score_map[:, zs:zs + patch_size[0], ys:ys + patch_size[1], xs:xs + patch_size[2]] += prob
+                        cnt[zs:zs + patch_size[0], ys:ys + patch_size[1], xs:xs + patch_size[2]] += 1.0
+                        
+            score_map = score_map / np.expand_dims(cnt, axis=0)
+            pred = np.argmax(score_map, axis=0)[:z, :y, :x]
+            
+            gt = (label > 0).astype(np.uint8)
+            pred_bin = (pred > 0).astype(np.uint8)
+            
+            if np.sum(gt) == 0 and np.sum(pred_bin) == 0:
+                dices.append(1.0)
+            elif np.sum(gt) == 0 or np.sum(pred_bin) == 0:
+                dices.append(0.0)
+            else:
+                metric = calculate_metric_percase(pred_bin, gt)
+                dices.append(metric[0])
+                
+    return float(np.mean(dices)) if len(dices) > 0 else 0.0
+
+
+def pre_train(snapshot_path, val_dataset):
+    print("=== [BHSD Binary] STARTING PRE-TRAINING PHASE ===")
+    model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")
+    model = nn.DataParallel(model).cuda()
+
+    db_train = BHSDDataset(
+        base_dir=args.root_path,
+        split='train',
+        binary=True,
+        patch_size=patch_size,
+        fold=args.fold,
+        transform=transforms.Compose([
+            RandomRotFlip(),
+            RandomCrop(patch_size),
+            ToTensor()
+        ])
+    )
+
+    labelnum = min(args.labelnum, len(db_train))
+    max_samples = len(db_train) if args.max_samples <= 0 else min(args.max_samples, len(db_train))
+    labeled_idxs = list(range(labelnum))
+    unlabeled_idxs = list(range(labelnum, max_samples))
+    
+    batch_sampler = TwoStreamBatchSampler(
+        labeled_idxs, unlabeled_idxs, args.batch_size, args.batch_size - args.labeled_bs
+    )
+    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=False)
+
+    optimizer = optim.SGD(model.parameters(), lr=args.base_lr, momentum=0.9, weight_decay=0.0001)
+    DICE = losses.mask_DiceLoss(nclass=num_classes)
+
+    model.train()
+    writer = SummaryWriter(os.path.join(snapshot_path, 'log'))
+    iter_num = 0
+    best_dice = 0.0
+    max_epoch = args.pre_max_iteration // max(len(trainloader), 1) + 1
+
+    for _ in range(max_epoch):
+        for _, (sampled_batch, mim_mask) in enumerate(trainloader):
+            volume_batch = sampled_batch['image'][:args.labeled_bs].cuda()
+            label_batch = sampled_batch['label'][:args.labeled_bs].cuda()
+            mim_mask = mim_mask[:args.labeled_bs].unsqueeze(1).cuda().float()
+
+            img_a, img_b = volume_batch, torch.flip(volume_batch, dims=[0])
+            lab_a, lab_b = label_batch, torch.flip(label_batch, dims=[0])
+
+            with torch.no_grad():
+                img_mask, _ = context_mask(img_a, args.mask_ratio)
+
+            cutmix_batch = img_a * img_mask + img_b * (1 - img_mask)
+            cutmix_label = lab_a * img_mask + lab_b * (1 - img_mask)
+            num_cutmix = cutmix_batch.shape[0]
+
+            _, main_outputs, _ = model(torch.cat((cutmix_batch, volume_batch), dim=0))
+
+            main_prob = F.softmax(main_outputs.detach(), dim=1)
+            threshold = 0.5 if iter_num > 2000 else 0.2
+            main_ps_lab = (main_prob[num_cutmix:, 1, :, :, :] > threshold).unsqueeze(1).float()
+
+            mask_region = main_ps_lab if iter_num > 2000 else mim_mask
+            mim_batch = volume_batch * (1 - mask_region)
+            mim_outputs = model.module.mim_forward(mim_batch)
+
+            re_batch = volume_batch * (1 - mask_region) + mim_outputs.detach() * mask_region
+            aux_outputs = model.module.aux_forward(re_batch)
+
+            loss_main_ce = F.cross_entropy(main_outputs, torch.cat((cutmix_label, label_batch), dim=0))
+            loss_main_dice = DICE(main_outputs, torch.cat((cutmix_label, label_batch), dim=0))
+            loss_main = (loss_main_ce + loss_main_dice) / 2
+
+            loss_mim = F.l1_loss(volume_batch, mim_outputs, reduction='none')
+            loss_mim = args.lambda_ * (loss_mim * mask_region).sum() / (mask_region.sum() + 1e-5)
+
+            loss_aux_ce = F.cross_entropy(aux_outputs, label_batch)
+            loss_aux_dice = DICE(aux_outputs, label_batch)
+            loss_aux = (loss_aux_ce + loss_aux_dice) / 2
+
+            loss = loss_main + loss_mim + loss_aux
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            iter_num += 1
+            writer.add_scalar('loss/total', loss.item(), iter_num)
+            writer.add_scalar('loss/main', loss_main.item(), iter_num)
+            writer.add_scalar('loss/mim', loss_mim.item(), iter_num)
+            writer.add_scalar('loss/aux', loss_aux.item(), iter_num)
+            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], iter_num)
+
+            if iter_num % 50 == 0:
+                logging.info(f"Pre-train Iter {iter_num}: Loss: {loss.item():.4f}, Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}")
+
+            if iter_num % 200 == 0:
+                val_dice = validate(model, val_dataset, patch_size=patch_size)
+                logging.info(f"[Pre-train Validation] Iter {iter_num} | Dice: {val_dice:.4f} (Best: {best_dice:.4f})")
+                writer.add_scalar('val/dice', val_dice, iter_num)
+                if val_dice > best_dice:
+                    best_dice = val_dice
+                    save_net_opt(model, optimizer, os.path.join(snapshot_path, f"{args.model}_best_model.pth"))
+                writer.add_scalar('val/best_dice', best_dice, iter_num)
+                model.train()
+
+            if iter_num >= args.pre_max_iteration:
+                break
+        if iter_num >= args.pre_max_iteration:
+            break
+
+    writer.close()
+    print(f"=== [BHSD Binary] PRE-TRAINING FINISHED | Best Dice: {best_dice:.4f} ===")
+
+
+def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
+    print("=== [BHSD Binary] STARTING SELF-TRAINING PHASE ===")
+    model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")
+    model = nn.DataParallel(model).cuda()
+
+    best_pth = os.path.join(pre_snapshot_path, f"{args.model}_best_model.pth")
+    if os.path.exists(best_pth):
+        load_net(model, best_pth)
+        print(f"[INFO] Loaded pre-trained weights from {best_pth}")
+
+    db_train = BHSDDataset(
+        base_dir=args.root_path,
+        split='train',
+        binary=True,
+        patch_size=patch_size,
+        fold=args.fold,
+        transform=transforms.Compose([
+            RandomRotFlip(),
+            RandomCrop(patch_size),
+            ToTensor()
+        ])
+    )
+
+    labelnum = min(args.labelnum, len(db_train))
+    max_samples = len(db_train) if args.max_samples <= 0 else min(args.max_samples, len(db_train))
+    labeled_idxs = list(range(labelnum))
+    unlabeled_idxs = list(range(labelnum, max_samples))
+    sub_bs = int(args.labeled_bs / 2)
+
+    batch_sampler = TwoStreamBatchSampler(
+        labeled_idxs, unlabeled_idxs, args.batch_size, args.batch_size - args.labeled_bs
+    )
+    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=False)
+
+    optimizer = optim.SGD(model.parameters(), lr=args.base_lr, momentum=0.9, weight_decay=0.0001)
+    DICE = losses.mask_DiceLoss(nclass=num_classes)
+
+    model.train()
+    writer = SummaryWriter(os.path.join(self_snapshot_path, 'log'))
+    iter_num = 0
+    best_dice = 0.0
+    max_epoch = args.self_max_iteration // max(len(trainloader), 1) + 1
+
+    for _ in range(max_epoch):
+        for _, (sampled_batch, mim_mask) in enumerate(trainloader):
+            volume_batch = sampled_batch['image'].cuda()
+            label_batch = sampled_batch['label'].cuda()
+
+            img_a, img_b = volume_batch[:sub_bs], volume_batch[sub_bs:args.labeled_bs]
+            lab_a, lab_b = label_batch[:sub_bs], label_batch[sub_bs:args.labeled_bs]
+            unimg = volume_batch[args.labeled_bs:]
+            laimg = volume_batch[:args.labeled_bs]
+
+            unimg_a, unimg_b = unimg[:sub_bs], unimg[sub_bs:]
+
+            with torch.no_grad():
+                _, un_main_outputs, _ = model(unimg)
+                un_prob = F.softmax(un_main_outputs, dim=1)
+                un_ps_lab = (un_prob[:, 1, :, :, :] > 0.5).unsqueeze(1).float()
+
+            with torch.no_grad():
+                img_mask, _ = context_mask(img_a, args.mask_ratio)
+
+            cutmix_batch_f = img_a * img_mask + unimg_a * (1 - img_mask)
+            cutmix_label_f = lab_a * img_mask
+            cutmix_batch_b = unimg_b * img_mask + img_b * (1 - img_mask)
+            cutmix_label_b = lab_b * (1 - img_mask)
+            cutmix_label = torch.cat((cutmix_label_f, cutmix_label_b), dim=0)
+
+            _, main_outputs, _ = model(torch.cat((cutmix_batch_f, cutmix_batch_b), dim=0))
+            main_outputs[:sub_bs] = main_outputs[:sub_bs] * img_mask
+            main_outputs[sub_bs:] = main_outputs[sub_bs:] * (1 - img_mask)
+
+            mask_region = un_ps_lab
+            mim_batch = unimg * (1 - mask_region)
+            mim_outputs = model.module.mim_forward(mim_batch)
+
+            re_batch = unimg * (1 - mask_region) + mim_outputs.detach() * mask_region
+            re_batch = torch.flip(re_batch, dims=[2])
+            aux_outputs = model.module.aux_forward(torch.cat((re_batch, laimg), dim=0))
+
+            loss_main_ce = F.cross_entropy(main_outputs, cutmix_label)
+            loss_main_dice = DICE(main_outputs, cutmix_label)
+            loss_main = (loss_main_ce + loss_main_dice) / 2
+
+            loss_mim = F.l1_loss(unimg, mim_outputs, reduction='none')
+            loss_mim = args.lambda_ * (loss_mim * mask_region).sum() / (mask_region.sum() + 1e-5)
+
+            loss_aux_ce = F.cross_entropy(aux_outputs[unimg.shape[0]:], label_batch[:args.labeled_bs])
+            loss_aux_dice = DICE(aux_outputs[unimg.shape[0]:], label_batch[:args.labeled_bs])
+            loss_aux = (loss_aux_ce + loss_aux_dice) / 2
+
+            loss = loss_main + loss_mim + loss_aux
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            iter_num += 1
+            writer.add_scalar('loss/total', loss.item(), iter_num)
+            writer.add_scalar('loss/main', loss_main.item(), iter_num)
+            writer.add_scalar('loss/mim', loss_mim.item(), iter_num)
+            writer.add_scalar('loss/aux', loss_aux.item(), iter_num)
+            writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], iter_num)
+
+            if iter_num % 50 == 0:
+                logging.info(f"Self-train Iter {iter_num}: Loss: {loss.item():.4f}, Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}")
+
+            if iter_num % 200 == 0:
+                val_dice = validate(model, val_dataset, patch_size=patch_size)
+                logging.info(f"[Self-train Validation] Iter {iter_num} | Dice: {val_dice:.4f} (Best: {best_dice:.4f})")
+                writer.add_scalar('val/dice', val_dice, iter_num)
+                if val_dice > best_dice:
+                    best_dice = val_dice
+                    save_net_opt(model, optimizer, os.path.join(self_snapshot_path, f"{args.model}_best_model.pth"))
+                writer.add_scalar('val/best_dice', best_dice, iter_num)
+                model.train()
+
+            if iter_num >= args.self_max_iteration:
+                break
+        if iter_num >= args.self_max_iteration:
+            break
+
+    writer.close()
+    print(f"=== [BHSD Binary] SELF-TRAINING FINISHED | Best Dice: {best_dice:.4f} ===")
+
+
+def main():
+    fold_dir = os.path.join(args.exp_dir, args.exp, f"fold_{args.fold}")
+    pre_snapshot = os.path.join(fold_dir, "pre_train")
+    self_snapshot = os.path.join(fold_dir, "self_train")
+    os.makedirs(pre_snapshot, exist_ok=True)
+    os.makedirs(self_snapshot, exist_ok=True)
+
+    logging.basicConfig(
+        filename=os.path.join(fold_dir, "train.log"),
+        level=logging.INFO,
+        format='[%(asctime)s.%(msecs)03d] %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+
+    val_dataset = BHSDDataset(base_dir=args.root_path, split='val', binary=True, patch_size=patch_size, fold=args.fold)
+
+    pre_train(pre_snapshot, val_dataset)
+    self_train(pre_snapshot, self_snapshot, val_dataset)
+
+
+if __name__ == "__main__":
+    main()
