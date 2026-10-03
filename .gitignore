@@ -5,3 +5,6 @@ __pycache__/
 *.err
 experiments/
 .ipynb_checkpoints/
+pick_code.zip
+*.zip
+*.tar.gz
