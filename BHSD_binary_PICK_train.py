@@ -42,6 +42,7 @@ parser.add_argument('--lambda_', type=float, default=0.2, help='MIM loss balance
 parser.add_argument('--mask_ratio', type=float, default=2/3, help='Mask ratio for CutMix and context masking')
 parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3, 4], help='Fold index for 5-fold cross-validation')
 parser.add_argument('--exp_dir', type=str, default='../experiments', help='Base directory to save experiments')
+parser.add_argument('--resume', action='store_true', default=False, help='Resume training from latest checkpoint if available')
 args = parser.parse_args()
 
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -58,14 +59,44 @@ patch_size = (32, 160, 160)
 num_classes = 2  # 0: Background, 1: Hemorrhage
 
 
-def save_net_opt(net, optimizer, path):
-    state = {'net': net.state_dict(), 'opt': optimizer.state_dict()}
+def save_checkpoint(net, optimizer, iter_num, best_dice, phase, path):
+    """Save full training state including weights, optimizer, iter_num, and best_dice."""
+    state = {
+        'net': net.state_dict(),
+        'opt': optimizer.state_dict() if optimizer is not None else None,
+        'iter_num': iter_num,
+        'best_dice': best_dice,
+        'phase': phase
+    }
     torch.save(state, str(path))
 
 
+def load_checkpoint(net, optimizer, path):
+    """Load training state for resuming."""
+    state = torch.load(str(path), map_location='cuda:0' if torch.cuda.is_available() else 'cpu')
+    if 'net' in state:
+        net.load_state_dict(state['net'])
+    else:
+        net.load_state_dict(state)
+
+    if optimizer is not None and 'opt' in state and state['opt'] is not None:
+        optimizer.load_state_dict(state['opt'])
+
+    iter_num = state.get('iter_num', 0)
+    best_dice = state.get('best_dice', 0.0)
+    return iter_num, best_dice
+
+
+def save_net_opt(net, optimizer, path, iter_num=0, best_dice=0.0, phase='train'):
+    save_checkpoint(net, optimizer, iter_num, best_dice, phase, path)
+
+
 def load_net(net, path):
-    state = torch.load(str(path))
-    net.load_state_dict(state['net'])
+    state = torch.load(str(path), map_location='cuda:0' if torch.cuda.is_available() else 'cpu')
+    if 'net' in state:
+        net.load_state_dict(state['net'])
+    else:
+        net.load_state_dict(state)
 
 
 def get_current_consistency_weight(epoch):
@@ -166,7 +197,18 @@ def pre_train(snapshot_path, val_dataset):
     writer = SummaryWriter(os.path.join(snapshot_path, 'log'))
     iter_num = 0
     best_dice = 0.0
-    max_epoch = args.pre_max_iteration // max(len(trainloader), 1) + 1
+
+    latest_pth = os.path.join(snapshot_path, "checkpoint_latest.pth")
+    if args.resume and os.path.exists(latest_pth):
+        iter_num, best_dice = load_checkpoint(model, optimizer, latest_pth)
+        logging.info(f"[RESUME] Resumed pre-training from iter {iter_num} | best_dice: {best_dice:.4f}")
+        if iter_num >= args.pre_max_iteration:
+            logging.info(f"[RESUME] Pre-training already completed ({iter_num}/{args.pre_max_iteration}). Skipping pre-train phase.")
+            writer.close()
+            return
+
+    remaining_iters = max(args.pre_max_iteration - iter_num, 0)
+    max_epoch = remaining_iters // max(len(trainloader), 1) + 2
 
     for _ in range(max_epoch):
         for _, (sampled_batch, mim_mask) in enumerate(trainloader):
@@ -230,14 +272,22 @@ def pre_train(snapshot_path, val_dataset):
                 writer.add_scalar('val/dice', val_dice, iter_num)
                 if val_dice > best_dice:
                     best_dice = val_dice
-                    save_net_opt(model, optimizer, os.path.join(snapshot_path, f"{args.model}_best_model.pth"))
+                    save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', os.path.join(snapshot_path, f"{args.model}_best_model.pth"))
                 writer.add_scalar('val/best_dice', best_dice, iter_num)
+                # Regularly save latest checkpoint for resuming
+                save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', latest_pth)
                 model.train()
 
             if iter_num >= args.pre_max_iteration:
                 break
         if iter_num >= args.pre_max_iteration:
             break
+
+    # Save final checkpoints
+    save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', latest_pth)
+    best_pth = os.path.join(snapshot_path, f"{args.model}_best_model.pth")
+    if not os.path.exists(best_pth):
+        save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', best_pth)
 
     writer.close()
     print(f"=== [BHSD Binary] PRE-TRAINING FINISHED | Best Dice: {best_dice:.4f} ===")
@@ -247,11 +297,6 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
     print("=== [BHSD Binary] STARTING SELF-TRAINING PHASE ===")
     model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")
     model = nn.DataParallel(model).cuda()
-
-    best_pth = os.path.join(pre_snapshot_path, f"{args.model}_best_model.pth")
-    if os.path.exists(best_pth):
-        load_net(model, best_pth)
-        print(f"[INFO] Loaded pre-trained weights from {best_pth}")
 
     db_train = BHSDDataset(
         base_dir=args.root_path,
@@ -284,7 +329,23 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
     writer = SummaryWriter(os.path.join(self_snapshot_path, 'log'))
     iter_num = 0
     best_dice = 0.0
-    max_epoch = args.self_max_iteration // max(len(trainloader), 1) + 1
+
+    latest_pth = os.path.join(self_snapshot_path, "checkpoint_latest.pth")
+    if args.resume and os.path.exists(latest_pth):
+        iter_num, best_dice = load_checkpoint(model, optimizer, latest_pth)
+        logging.info(f"[RESUME] Resumed self-training from iter {iter_num} | best_dice: {best_dice:.4f}")
+        if iter_num >= args.self_max_iteration:
+            logging.info(f"[RESUME] Self-training already completed ({iter_num}/{args.self_max_iteration}). Skipping self-train phase.")
+            writer.close()
+            return
+    else:
+        best_pth = os.path.join(pre_snapshot_path, f"{args.model}_best_model.pth")
+        if os.path.exists(best_pth):
+            load_net(model, best_pth)
+            logging.info(f"[INFO] Loaded pre-trained weights from {best_pth}")
+
+    remaining_iters = max(args.self_max_iteration - iter_num, 0)
+    max_epoch = remaining_iters // max(len(trainloader), 1) + 2
 
     for _ in range(max_epoch):
         for _, (sampled_batch, mim_mask) in enumerate(trainloader):
@@ -357,8 +418,10 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
                 writer.add_scalar('val/dice', val_dice, iter_num)
                 if val_dice > best_dice:
                     best_dice = val_dice
-                    save_net_opt(model, optimizer, os.path.join(self_snapshot_path, f"{args.model}_best_model.pth"))
+                    save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', os.path.join(self_snapshot_path, f"{args.model}_best_model.pth"))
                 writer.add_scalar('val/best_dice', best_dice, iter_num)
+                # Regularly save latest checkpoint for resuming
+                save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', latest_pth)
                 model.train()
 
             if iter_num >= args.self_max_iteration:
@@ -366,11 +429,23 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
         if iter_num >= args.self_max_iteration:
             break
 
+    # Save final checkpoints
+    save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', latest_pth)
+    best_pth = os.path.join(self_snapshot_path, f"{args.model}_best_model.pth")
+    if not os.path.exists(best_pth):
+        save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', best_pth)
+
     writer.close()
     print(f"=== [BHSD Binary] SELF-TRAINING FINISHED | Best Dice: {best_dice:.4f} ===")
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     fold_dir = os.path.join(args.exp_dir, args.exp, f"fold_{args.fold}")
     pre_snapshot = os.path.join(fold_dir, "pre_train")
     self_snapshot = os.path.join(fold_dir, "self_train")
