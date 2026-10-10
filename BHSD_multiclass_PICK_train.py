@@ -111,6 +111,37 @@ def load_net(net, path):
     raw_net.load_state_dict(clean_dict)
 
 
+def restore_from_wandb(dest_dir, artifact_name, project, entity=None):
+    """Attempt to restore a checkpoint artifact from W&B Cloud."""
+    try:
+        import wandb
+        api = wandb.Api()
+        if not entity:
+            try:
+                entity = api.default_entity
+            except Exception:
+                entity = None
+
+        candidates = []
+        if entity:
+            candidates.append(f"{entity}/{project}/{artifact_name}:latest")
+        candidates.append(f"{project}/{artifact_name}:latest")
+        candidates.append(f"{artifact_name}:latest")
+
+        for cand in candidates:
+            try:
+                artifact = api.artifact(cand)
+                os.makedirs(dest_dir, exist_ok=True)
+                artifact.download(root=dest_dir)
+                logging.info(f"[W&B CLOUD] Successfully restored artifact '{cand}' to {dest_dir}!")
+                return True
+            except Exception:
+                continue
+    except Exception as e:
+        logging.warning(f"[W&B CLOUD] Failed to restore from W&B API: {e}")
+    return False
+
+
 def cal_multiclass_dice(pred, gt, num_classes=6):
     """Calculate per-class Dice scores for classes 1..num_classes-1."""
     class_dices = []
@@ -224,6 +255,10 @@ def pre_train(snapshot_path, val_dataset):
     best_dice = 0.0
 
     latest_pth = os.path.join(snapshot_path, "checkpoint_latest.pth")
+    if args.resume and not os.path.exists(latest_pth) and args.use_wandb:
+        logging.info("[RESUME] Local pre-train checkpoint not found. Attempting to restore from W&B Cloud...")
+        restore_from_wandb(snapshot_path, f"{args.exp}_pretrain_latest", args.wandb_project, args.wandb_entity)
+
     if args.resume and os.path.exists(latest_pth):
         iter_num, best_dice = load_checkpoint(model, optimizer, latest_pth)
         logging.info(f"[RESUME] Resumed pre-training from iter {iter_num} | best_mDice: {best_dice:.4f}")
@@ -340,6 +375,14 @@ def pre_train(snapshot_path, val_dataset):
 
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', latest_pth)
+                if args.use_wandb and args.save_wandb_model:
+                    try:
+                        import wandb
+                        art = wandb.Artifact(f"{args.exp}_pretrain_latest", type="checkpoint", description=f"Pre-train latest checkpoint at iter {iter_num}")
+                        art.add_file(latest_pth)
+                        wandb.log_artifact(art)
+                    except Exception as e:
+                        logging.warning(f"[W&B] Failed to log latest checkpoint artifact: {e}")
                 model.train()
 
             if iter_num >= args.pre_max_iteration:
@@ -400,6 +443,10 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
     best_dice = 0.0
 
     latest_pth = os.path.join(self_snapshot_path, "checkpoint_latest.pth")
+    if args.resume and not os.path.exists(latest_pth) and args.use_wandb:
+        logging.info("[RESUME] Local self-train checkpoint not found. Attempting to restore from W&B Cloud...")
+        restore_from_wandb(self_snapshot_path, f"{args.exp}_self_latest", args.wandb_project, args.wandb_entity)
+
     if args.resume and os.path.exists(latest_pth):
         iter_num, best_dice = load_checkpoint(model, optimizer, latest_pth)
         logging.info(f"[RESUME] Resumed self-training from iter {iter_num} | best_mDice: {best_dice:.4f}")
@@ -413,6 +460,10 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
             pretrain_candidate = args.pretrain_checkpoint
         else:
             best_pth = os.path.join(pre_snapshot_path, f"{args.model}_best_model.pth")
+            if not os.path.exists(best_pth) and args.use_wandb:
+                logging.info("[RESUME] Attempting to restore pre-train weights from W&B Cloud...")
+                restore_from_wandb(pre_snapshot_path, f"{args.exp}_pretrain_best", args.wandb_project, args.wandb_entity)
+
             if os.path.exists(best_pth):
                 pretrain_candidate = best_pth
             elif os.path.exists(os.path.join(pre_snapshot_path, "checkpoint_latest.pth")):
@@ -542,6 +593,14 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
 
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', latest_pth)
+                if args.use_wandb and args.save_wandb_model:
+                    try:
+                        import wandb
+                        art = wandb.Artifact(f"{args.exp}_self_latest", type="checkpoint", description=f"Self-train latest checkpoint at iter {iter_num}")
+                        art.add_file(latest_pth)
+                        wandb.log_artifact(art)
+                    except Exception as e:
+                        logging.warning(f"[W&B] Failed to log latest checkpoint artifact: {e}")
                 model.train()
 
             if iter_num >= args.self_max_iteration:
