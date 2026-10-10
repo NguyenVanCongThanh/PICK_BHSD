@@ -340,15 +340,16 @@ def pre_train(snapshot_path, val_dataset):
 
             if args.use_wandb:
                 import wandb
-                wandb.log({
-                    'train/loss_total': loss.item(),
-                    'train/loss_main': loss_main.item(),
-                    'train/loss_mim': loss_mim.item(),
-                    'train/loss_aux': loss_aux.item(),
-                    'train/lr': optimizer.param_groups[0]['lr'],
-                    'phase': 'pre_train',
-                    'pre_train/iter': iter_num,
-                }, step=iter_num)
+                if wandb.run is None or not hasattr(wandb.run, 'step') or wandb.run.step is None or iter_num > wandb.run.step:
+                    wandb.log({
+                        'train/loss_total': loss.item(),
+                        'train/loss_main': loss_main.item(),
+                        'train/loss_mim': loss_mim.item(),
+                        'train/loss_aux': loss_aux.item(),
+                        'train/lr': optimizer.param_groups[0]['lr'],
+                        'phase': 'pre_train',
+                        'pre_train/iter': iter_num,
+                    }, step=iter_num)
 
             if iter_num % 10 == 0 or iter_num == 1:
                 elapsed_10 = time.time() - iter_t0
@@ -575,15 +576,17 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
             if args.use_wandb:
                 import wandb
                 global_step = args.pre_max_iteration + iter_num
-                wandb.log({
-                    'train/loss_total': loss.item(),
-                    'train/loss_main': loss_main.item(),
-                    'train/loss_mim': loss_mim.item(),
-                    'train/loss_aux': loss_aux.item(),
-                    'train/lr': optimizer.param_groups[0]['lr'],
-                    'phase': 'self_train',
-                    'self_train/iter': iter_num,
-                }, step=global_step)
+                # Tránh cảnh báo step nhỏ hơn phiên trước khi resume
+                if wandb.run is None or not hasattr(wandb.run, 'step') or wandb.run.step is None or global_step > wandb.run.step:
+                    wandb.log({
+                        'train/loss_total': loss.item(),
+                        'train/loss_main': loss_main.item(),
+                        'train/loss_mim': loss_mim.item(),
+                        'train/loss_aux': loss_aux.item(),
+                        'train/lr': optimizer.param_groups[0]['lr'],
+                        'phase': 'self_train',
+                        'self_train/iter': iter_num,
+                    }, step=global_step)
 
             if iter_num % 10 == 0 or iter_num == 1:
                 elapsed_10 = time.time() - iter_t0
@@ -634,7 +637,8 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
                     }
                     for c, d in enumerate(per_class):
                         val_metrics[f'val/dice_{CLASS_NAMES[c+1]}'] = d
-                    wandb.log(val_metrics, step=global_step)
+                    if wandb.run is None or not hasattr(wandb.run, 'step') or wandb.run.step is None or global_step > wandb.run.step:
+                        wandb.log(val_metrics, step=global_step)
 
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', latest_pth)
