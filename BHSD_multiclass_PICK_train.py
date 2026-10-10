@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import shutil
 import argparse
 import logging
@@ -162,9 +163,12 @@ def validate_multiclass(model, val_dataset, patch_size=(32, 160, 160), stride_z=
     """Sliding-window 3D inference for multi-class (6 classes) evaluation."""
     model.eval()
     all_case_dices = []  # List of [dice_c1, dice_c2, ..., dice_c5]
+    total_cases = len(val_dataset)
+    val_t0 = time.time()
+    logging.info(f"  [Validation] Đang đánh giá {total_cases} ca kiểm định (patch={patch_size}, stride_xy={stride_xy})...")
 
     with torch.no_grad():
-        for i in range(len(val_dataset)):
+        for i in range(total_cases):
             sample, _ = val_dataset[i]
             image, label = sample['image'], sample['label']
             z, y, x = image.shape
@@ -204,6 +208,13 @@ def validate_multiclass(model, val_dataset, patch_size=(32, 160, 160), stride_z=
 
             case_dices = cal_multiclass_dice(pred, label, num_classes=num_classes)
             all_case_dices.append(case_dices)
+
+            if (i + 1) % 10 == 0 or (i + 1) == total_cases:
+                elapsed_v = time.time() - val_t0
+                logging.info(f"  [Validation Progress] Đã xong {i+1}/{total_cases} ca ({(i+1)/total_cases*100:.0f}%) | {elapsed_v:.1f}s")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if len(all_case_dices) == 0:
         return 0.0, [0.0] * 5
@@ -269,8 +280,9 @@ def pre_train(snapshot_path, val_dataset):
 
     remaining_iters = max(args.pre_max_iteration - iter_num, 0)
     max_epoch = remaining_iters // max(len(trainloader), 1) + 2
+    iter_t0 = time.time()
 
-    for _ in range(max_epoch):
+    for epoch in range(max_epoch):
         for _, (sampled_batch, mim_mask) in enumerate(trainloader):
             volume_batch = sampled_batch['image'][:args.labeled_bs].cuda()
             label_batch = sampled_batch['label'][:args.labeled_bs].cuda()
@@ -338,13 +350,27 @@ def pre_train(snapshot_path, val_dataset):
                     'pre_train/iter': iter_num,
                 }, step=iter_num)
 
-            if iter_num % 50 == 0:
-                logging.info(f"Pre-train Iter {iter_num}: Loss: {loss.item():.4f}, Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}")
+            if iter_num % 10 == 0 or iter_num == 1:
+                elapsed_10 = time.time() - iter_t0
+                sec_per_it = elapsed_10 / 10 if iter_num > 1 else elapsed_10
+                rem_steps = max(args.pre_max_iteration - iter_num, 0)
+                eta_sec = rem_steps * sec_per_it
+                eta_str = time.strftime('%Hh%Mm%Ss', time.gmtime(eta_sec)) if eta_sec < 86400 else f"{eta_sec/3600:.1f}h"
+                vram_used = torch.cuda.memory_reserved() / (1024**3) if torch.cuda.is_available() else 0
+                pct = (iter_num / args.pre_max_iteration) * 100
+                logging.info(
+                    f"[Pre-train] Iter {iter_num}/{args.pre_max_iteration} ({pct:.1f}%) | "
+                    f"Speed: {sec_per_it:.2f}s/it | ETA: {eta_str} | "
+                    f"Loss: {loss.item():.4f} (Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}, Aux: {loss_aux.item():.4f}) | "
+                    f"VRAM: {vram_used:.1f}GB"
+                )
+                iter_t0 = time.time()
 
             if iter_num % args.val_interval == 0:
+                logging.info(f"\n>>> [Pre-train Validation] Bắt đầu đánh giá định kỳ tại Iter {iter_num}...")
                 val_mdice, per_class = validate_multiclass(model, val_dataset, patch_size=patch_size, stride_xy=args.val_stride_xy)
                 class_str = ", ".join([f"{CLASS_NAMES[c+1]}: {d:.3f}" for c, d in enumerate(per_class)])
-                logging.info(f"[Pre-train Validation] Iter {iter_num} | mDice: {val_mdice:.4f} ({class_str})")
+                logging.info(f"<<< [Pre-train Validation] Iter {iter_num} | mDice: {val_mdice:.4f} (Best: {best_dice:.4f}) | {class_str}")
                 writer.add_scalar('val/mDice', val_mdice, iter_num)
                 for c, d in enumerate(per_class):
                     writer.add_scalar(f'val/dice_{CLASS_NAMES[c+1]}', d, iter_num)
@@ -352,6 +378,7 @@ def pre_train(snapshot_path, val_dataset):
                     best_dice = val_mdice
                     best_model_path = os.path.join(snapshot_path, f"{args.model}_best_model.pth")
                     save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', best_model_path)
+                    logging.info(f"  [★ NEW BEST MODEL] Lưu pre-train model tốt nhất mới: mDice {best_dice:.4f}")
                     if args.use_wandb and args.save_wandb_model:
                         try:
                             import wandb
@@ -375,6 +402,7 @@ def pre_train(snapshot_path, val_dataset):
 
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', latest_pth)
+                logging.info(f"  [Checkpoint Saved] Đã lưu latest checkpoint tại iter {iter_num}\n")
                 if args.use_wandb and args.save_wandb_model:
                     try:
                         import wandb
@@ -384,6 +412,7 @@ def pre_train(snapshot_path, val_dataset):
                     except Exception as e:
                         logging.warning(f"[W&B] Failed to log latest checkpoint artifact: {e}")
                 model.train()
+                iter_t0 = time.time()
 
             if iter_num >= args.pre_max_iteration:
                 break
@@ -477,8 +506,9 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
 
     remaining_iters = max(args.self_max_iteration - iter_num, 0)
     max_epoch = remaining_iters // max(len(trainloader), 1) + 2
+    iter_t0 = time.time()
 
-    for _ in range(max_epoch):
+    for epoch in range(max_epoch):
         for _, (sampled_batch, mim_mask) in enumerate(trainloader):
             volume_batch = sampled_batch['image'].cuda()
             label_batch = sampled_batch['label'].cuda()
@@ -555,13 +585,27 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
                     'self_train/iter': iter_num,
                 }, step=global_step)
 
-            if iter_num % 50 == 0:
-                logging.info(f"Self-train Iter {iter_num}: Loss: {loss.item():.4f}, Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}")
+            if iter_num % 10 == 0 or iter_num == 1:
+                elapsed_10 = time.time() - iter_t0
+                sec_per_it = elapsed_10 / 10 if iter_num > 1 else elapsed_10
+                rem_steps = max(args.self_max_iteration - iter_num, 0)
+                eta_sec = rem_steps * sec_per_it
+                eta_str = time.strftime('%Hh%Mm%Ss', time.gmtime(eta_sec)) if eta_sec < 86400 else f"{eta_sec/3600:.1f}h"
+                vram_used = torch.cuda.memory_reserved() / (1024**3) if torch.cuda.is_available() else 0
+                pct = (iter_num / args.self_max_iteration) * 100
+                logging.info(
+                    f"[Self-train] Iter {iter_num}/{args.self_max_iteration} ({pct:.1f}%) | "
+                    f"Speed: {sec_per_it:.2f}s/it | ETA: {eta_str} | "
+                    f"Loss: {loss.item():.4f} (Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}, Aux: {loss_aux.item():.4f}) | "
+                    f"VRAM: {vram_used:.1f}GB"
+                )
+                iter_t0 = time.time()
 
             if iter_num % args.val_interval == 0:
+                logging.info(f"\n>>> [Self-train Validation] Bắt đầu đánh giá định kỳ tại Iter {iter_num}...")
                 val_mdice, per_class = validate_multiclass(model, val_dataset, patch_size=patch_size, stride_xy=args.val_stride_xy)
                 class_str = ", ".join([f"{CLASS_NAMES[c+1]}: {d:.3f}" for c, d in enumerate(per_class)])
-                logging.info(f"[Self-train Validation] Iter {iter_num} | mDice: {val_mdice:.4f} ({class_str})")
+                logging.info(f"<<< [Self-train Validation] Iter {iter_num} | mDice: {val_mdice:.4f} (Best: {best_dice:.4f}) | {class_str}")
                 writer.add_scalar('val/mDice', val_mdice, iter_num)
                 for c, d in enumerate(per_class):
                     writer.add_scalar(f'val/dice_{CLASS_NAMES[c+1]}', d, iter_num)
@@ -569,6 +613,7 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
                     best_dice = val_mdice
                     best_model_path = os.path.join(self_snapshot_path, f"{args.model}_best_model.pth")
                     save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', best_model_path)
+                    logging.info(f"  [★ NEW BEST MODEL] Lưu self-train model tốt nhất mới: mDice {best_dice:.4f}")
                     if args.use_wandb and args.save_wandb_model:
                         try:
                             import wandb
@@ -593,6 +638,7 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
 
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', latest_pth)
+                logging.info(f"  [Checkpoint Saved] Đã lưu latest checkpoint tại iter {iter_num}\n")
                 if args.use_wandb and args.save_wandb_model:
                     try:
                         import wandb
@@ -602,6 +648,7 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
                     except Exception as e:
                         logging.warning(f"[W&B] Failed to log latest checkpoint artifact: {e}")
                 model.train()
+                iter_t0 = time.time()
 
             if iter_num >= args.self_max_iteration:
                 break
