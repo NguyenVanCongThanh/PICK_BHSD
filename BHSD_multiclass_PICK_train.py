@@ -33,7 +33,7 @@ parser.add_argument('--batch_size', type=int, default=4, help='Total batch size 
 parser.add_argument('--base_lr', type=float, default=0.01, help='Initial learning rate')
 parser.add_argument('--deterministic', type=int, default=1, help='Whether to use deterministic training')
 parser.add_argument('--labelnum', type=int, default=15, help='Number of labeled samples (~10% or ~20%)')
-parser.add_argument('--gpu', type=str, default='0', help='GPU ID to use')
+parser.add_argument('--gpu', type=str, default='auto', help='GPU ID to use (e.g. 0, 0,1, auto, or all)')
 parser.add_argument('--seed', type=int, default=1337, help='Random seed')
 parser.add_argument('--consistency', type=float, default=1.0, help='Consistency loss weight')
 parser.add_argument('--consistency_rampup', type=float, default=40.0, help='Consistency ramp-up epochs')
@@ -42,9 +42,19 @@ parser.add_argument('--mask_ratio', type=float, default=2/3, help='Mask ratio fo
 parser.add_argument('--fold', type=int, default=0, choices=[0, 1, 2, 3, 4], help='Fold index for 5-fold cross-validation')
 parser.add_argument('--exp_dir', type=str, default='../experiments', help='Base directory to save experiments')
 parser.add_argument('--resume', action='store_true', default=False, help='Resume training from latest checkpoint if available')
+parser.add_argument('--phase', type=str, default='all', choices=['all', 'pre_train', 'self_train'], help='Phase to execute: all, pre_train, or self_train')
+parser.add_argument('--pretrain_checkpoint', type=str, default='', help='Path to pre-trained checkpoint for self-training')
+parser.add_argument('--val_interval', type=int, default=500, help='Iterations interval between validations (e.g. 500)')
+parser.add_argument('--val_stride_xy', type=int, default=32, help='Sliding-window XY stride during validation (32 or 48)')
+parser.add_argument('--use_wandb', action='store_true', default=False, help='Enable Weights & Biases logging')
+parser.add_argument('--save_wandb_model', action='store_true', default=False, help='Save best model checkpoints to W&B Cloud Artifacts')
+parser.add_argument('--wandb_project', type=str, default='PICK_BHSD', help='W&B project name')
+parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/username/team')
+parser.add_argument('--wandb_run_name', type=str, default=None, help='W&B run display name')
 args = parser.parse_args()
 
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+if args.gpu not in ['auto', 'all']:
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
 
 if args.deterministic:
     cudnn.benchmark = False
@@ -61,8 +71,9 @@ CLASS_NAMES = ["Background", "Epidural", "Intraparenchymal", "Intraventricular",
 
 def save_checkpoint(net, optimizer, iter_num, best_dice, phase, path):
     """Save full training state including weights, optimizer, iter_num, and best_dice."""
+    raw_net = net.module if isinstance(net, nn.DataParallel) else net
     state = {
-        'net': net.state_dict(),
+        'net': raw_net.state_dict(),
         'opt': optimizer.state_dict() if optimizer is not None else None,
         'iter_num': iter_num,
         'best_dice': best_dice,
@@ -72,12 +83,12 @@ def save_checkpoint(net, optimizer, iter_num, best_dice, phase, path):
 
 
 def load_checkpoint(net, optimizer, path):
-    """Load training state for resuming."""
+    """Load training state for resuming, handling DataParallel prefix seamlessly."""
     state = torch.load(str(path), map_location='cuda:0' if torch.cuda.is_available() else 'cpu')
-    if 'net' in state:
-        net.load_state_dict(state['net'])
-    else:
-        net.load_state_dict(state)
+    net_dict = state.get('net', state)
+    raw_net = net.module if isinstance(net, nn.DataParallel) else net
+    clean_dict = {k[7:] if k.startswith('module.') else k: v for k, v in net_dict.items()}
+    raw_net.load_state_dict(clean_dict)
 
     if optimizer is not None and 'opt' in state and state['opt'] is not None:
         optimizer.load_state_dict(state['opt'])
@@ -92,11 +103,12 @@ def save_net_opt(net, optimizer, path, iter_num=0, best_dice=0.0, phase='train')
 
 
 def load_net(net, path):
+    """Load model weights, handling DataParallel prefix seamlessly."""
     state = torch.load(str(path), map_location='cuda:0' if torch.cuda.is_available() else 'cpu')
-    if 'net' in state:
-        net.load_state_dict(state['net'])
-    else:
-        net.load_state_dict(state)
+    net_dict = state.get('net', state)
+    raw_net = net.module if isinstance(net, nn.DataParallel) else net
+    clean_dict = {k[7:] if k.startswith('module.') else k: v for k, v in net_dict.items()}
+    raw_net.load_state_dict(clean_dict)
 
 
 def cal_multiclass_dice(pred, gt, num_classes=6):
@@ -173,7 +185,12 @@ def validate_multiclass(model, val_dataset, patch_size=(32, 160, 160), stride_z=
 def pre_train(snapshot_path, val_dataset):
     print("=== [BHSD Multi-class] STARTING PRE-TRAINING PHASE (6 Classes) ===")
     model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")
-    model = nn.DataParallel(model).cuda()
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model).cuda()
+        logging.info(f"[Model] Pre-train Multi-GPU enabled with {torch.cuda.device_count()} GPUs (DataParallel)")
+    else:
+        model = model.cuda()
+        logging.info(f"[Model] Pre-train Single-GPU enabled on {torch.cuda.get_device_name(0)}")
 
     db_train = BHSDDataset(
         base_dir=args.root_path,
@@ -244,10 +261,10 @@ def pre_train(snapshot_path, val_dataset):
 
             mask_region = main_ps_lab if iter_num > 2000 else mim_mask
             mim_batch = volume_batch * (1 - mask_region)
-            mim_outputs = model.module.mim_forward(mim_batch)
+            mim_outputs = model(mim_batch, mode='mim')
 
             re_batch = volume_batch * (1 - mask_region) + mim_outputs.detach() * mask_region
-            aux_outputs = model.module.aux_forward(re_batch)
+            aux_outputs = model(re_batch, mode='aux')
 
             combined_label = torch.cat((cutmix_label, label_batch), dim=0)
             loss_main_ce = F.cross_entropy(main_outputs, combined_label)
@@ -274,11 +291,23 @@ def pre_train(snapshot_path, val_dataset):
             writer.add_scalar('loss/aux', loss_aux.item(), iter_num)
             writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], iter_num)
 
+            if args.use_wandb:
+                import wandb
+                wandb.log({
+                    'train/loss_total': loss.item(),
+                    'train/loss_main': loss_main.item(),
+                    'train/loss_mim': loss_mim.item(),
+                    'train/loss_aux': loss_aux.item(),
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'phase': 'pre_train',
+                    'pre_train/iter': iter_num,
+                }, step=iter_num)
+
             if iter_num % 50 == 0:
                 logging.info(f"Pre-train Iter {iter_num}: Loss: {loss.item():.4f}, Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}")
 
-            if iter_num % 200 == 0:
-                val_mdice, per_class = validate_multiclass(model, val_dataset, patch_size=patch_size)
+            if iter_num % args.val_interval == 0:
+                val_mdice, per_class = validate_multiclass(model, val_dataset, patch_size=patch_size, stride_xy=args.val_stride_xy)
                 class_str = ", ".join([f"{CLASS_NAMES[c+1]}: {d:.3f}" for c, d in enumerate(per_class)])
                 logging.info(f"[Pre-train Validation] Iter {iter_num} | mDice: {val_mdice:.4f} ({class_str})")
                 writer.add_scalar('val/mDice', val_mdice, iter_num)
@@ -286,8 +315,29 @@ def pre_train(snapshot_path, val_dataset):
                     writer.add_scalar(f'val/dice_{CLASS_NAMES[c+1]}', d, iter_num)
                 if val_mdice > best_dice:
                     best_dice = val_mdice
-                    save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', os.path.join(snapshot_path, f"{args.model}_best_model.pth"))
+                    best_model_path = os.path.join(snapshot_path, f"{args.model}_best_model.pth")
+                    save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', best_model_path)
+                    if args.use_wandb and args.save_wandb_model:
+                        try:
+                            import wandb
+                            artifact = wandb.Artifact(f"{args.exp}_pretrain_best", type="model", description=f"Pre-train best model mDice: {best_dice:.4f}")
+                            artifact.add_file(best_model_path)
+                            wandb.log_artifact(artifact)
+                        except Exception as e:
+                            logging.warning(f"[W&B] Failed to log artifact: {e}")
                 writer.add_scalar('val/best_mDice', best_dice, iter_num)
+
+                if args.use_wandb:
+                    import wandb
+                    val_metrics = {
+                        'val/mDice': val_mdice,
+                        'val/best_mDice': best_dice,
+                        'pre_train/val_mDice': val_mdice,
+                    }
+                    for c, d in enumerate(per_class):
+                        val_metrics[f'val/dice_{CLASS_NAMES[c+1]}'] = d
+                    wandb.log(val_metrics, step=iter_num)
+
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'pre_train', latest_pth)
                 model.train()
@@ -310,7 +360,12 @@ def pre_train(snapshot_path, val_dataset):
 def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
     print("=== [BHSD Multi-class] STARTING SELF-TRAINING PHASE (6 Classes) ===")
     model = net_factory(net_type=args.model, in_chns=1, class_num=num_classes, mode="train")
-    model = nn.DataParallel(model).cuda()
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model).cuda()
+        logging.info(f"[Model] Self-train Multi-GPU enabled with {torch.cuda.device_count()} GPUs (DataParallel)")
+    else:
+        model = model.cuda()
+        logging.info(f"[Model] Self-train Single-GPU enabled on {torch.cuda.get_device_name(0)}")
 
     db_train = BHSDDataset(
         base_dir=args.root_path,
@@ -353,10 +408,21 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
             writer.close()
             return
     else:
-        best_pth = os.path.join(pre_snapshot_path, f"{args.model}_best_model.pth")
-        if os.path.exists(best_pth):
-            load_net(model, best_pth)
-            logging.info(f"[INFO] Loaded pre-trained weights from {best_pth}")
+        pretrain_candidate = None
+        if args.pretrain_checkpoint and os.path.exists(args.pretrain_checkpoint):
+            pretrain_candidate = args.pretrain_checkpoint
+        else:
+            best_pth = os.path.join(pre_snapshot_path, f"{args.model}_best_model.pth")
+            if os.path.exists(best_pth):
+                pretrain_candidate = best_pth
+            elif os.path.exists(os.path.join(pre_snapshot_path, "checkpoint_latest.pth")):
+                pretrain_candidate = os.path.join(pre_snapshot_path, "checkpoint_latest.pth")
+
+        if pretrain_candidate and os.path.exists(pretrain_candidate):
+            load_net(model, pretrain_candidate)
+            logging.info(f"[INFO] Loaded pre-trained weights from {pretrain_candidate}")
+        else:
+            logging.warning("[WARN] No pre-trained checkpoint found! Starting self-training from scratch.")
 
     remaining_iters = max(args.self_max_iteration - iter_num, 0)
     max_epoch = remaining_iters // max(len(trainloader), 1) + 2
@@ -395,11 +461,11 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
 
             mask_region = un_ps_lab
             mim_batch = unimg * (1 - mask_region)
-            mim_outputs = model.module.mim_forward(mim_batch)
+            mim_outputs = model(mim_batch, mode='mim')
 
             re_batch = unimg * (1 - mask_region) + mim_outputs.detach() * mask_region
             re_batch = torch.flip(re_batch, dims=[2])
-            aux_outputs = model.module.aux_forward(torch.cat((re_batch, laimg), dim=0))
+            aux_outputs = model(torch.cat((re_batch, laimg), dim=0), mode='aux')
 
             loss_main_ce = F.cross_entropy(main_outputs, cutmix_label)
             loss_main_dice = DICE(main_outputs, cutmix_label)
@@ -425,11 +491,24 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
             writer.add_scalar('loss/aux', loss_aux.item(), iter_num)
             writer.add_scalar('train/lr', optimizer.param_groups[0]['lr'], iter_num)
 
+            if args.use_wandb:
+                import wandb
+                global_step = args.pre_max_iteration + iter_num
+                wandb.log({
+                    'train/loss_total': loss.item(),
+                    'train/loss_main': loss_main.item(),
+                    'train/loss_mim': loss_mim.item(),
+                    'train/loss_aux': loss_aux.item(),
+                    'train/lr': optimizer.param_groups[0]['lr'],
+                    'phase': 'self_train',
+                    'self_train/iter': iter_num,
+                }, step=global_step)
+
             if iter_num % 50 == 0:
                 logging.info(f"Self-train Iter {iter_num}: Loss: {loss.item():.4f}, Main: {loss_main.item():.4f}, MIM: {loss_mim.item():.4f}")
 
-            if iter_num % 200 == 0:
-                val_mdice, per_class = validate_multiclass(model, val_dataset, patch_size=patch_size)
+            if iter_num % args.val_interval == 0:
+                val_mdice, per_class = validate_multiclass(model, val_dataset, patch_size=patch_size, stride_xy=args.val_stride_xy)
                 class_str = ", ".join([f"{CLASS_NAMES[c+1]}: {d:.3f}" for c, d in enumerate(per_class)])
                 logging.info(f"[Self-train Validation] Iter {iter_num} | mDice: {val_mdice:.4f} ({class_str})")
                 writer.add_scalar('val/mDice', val_mdice, iter_num)
@@ -437,8 +516,30 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
                     writer.add_scalar(f'val/dice_{CLASS_NAMES[c+1]}', d, iter_num)
                 if val_mdice > best_dice:
                     best_dice = val_mdice
-                    save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', os.path.join(self_snapshot_path, f"{args.model}_best_model.pth"))
+                    best_model_path = os.path.join(self_snapshot_path, f"{args.model}_best_model.pth")
+                    save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', best_model_path)
+                    if args.use_wandb and args.save_wandb_model:
+                        try:
+                            import wandb
+                            artifact = wandb.Artifact(f"{args.exp}_best_model", type="model", description=f"Self-train best model mDice: {best_dice:.4f}")
+                            artifact.add_file(best_model_path)
+                            wandb.log_artifact(artifact)
+                        except Exception as e:
+                            logging.warning(f"[W&B] Failed to log artifact: {e}")
                 writer.add_scalar('val/best_mDice', best_dice, iter_num)
+
+                if args.use_wandb:
+                    import wandb
+                    global_step = args.pre_max_iteration + iter_num
+                    val_metrics = {
+                        'val/mDice': val_mdice,
+                        'val/best_mDice': best_dice,
+                        'self_train/val_mDice': val_mdice,
+                    }
+                    for c, d in enumerate(per_class):
+                        val_metrics[f'val/dice_{CLASS_NAMES[c+1]}'] = d
+                    wandb.log(val_metrics, step=global_step)
+
                 # Regularly save latest checkpoint for resuming
                 save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', latest_pth)
                 model.train()
@@ -453,6 +554,15 @@ def self_train(pre_snapshot_path, self_snapshot_path, val_dataset):
     best_pth = os.path.join(self_snapshot_path, f"{args.model}_best_model.pth")
     if not os.path.exists(best_pth):
         save_checkpoint(model, optimizer, iter_num, best_dice, 'self_train', best_pth)
+
+    if args.use_wandb and args.save_wandb_model and os.path.exists(latest_pth):
+        try:
+            import wandb
+            artifact = wandb.Artifact(f"{args.exp}_latest_checkpoint", type="model", description="Latest self-train checkpoint")
+            artifact.add_file(latest_pth)
+            wandb.log_artifact(artifact)
+        except Exception:
+            pass
 
     writer.close()
     print(f"=== [BHSD Multi-class] SELF-TRAINING FINISHED | Best mDice: {best_dice:.4f} ===")
@@ -481,8 +591,39 @@ def main():
 
     val_dataset = BHSDDataset(base_dir=args.root_path, split='val', binary=False, patch_size=patch_size, fold=args.fold)
 
-    pre_train(pre_snapshot, val_dataset)
-    self_train(pre_snapshot, self_snapshot, val_dataset)
+    if args.use_wandb:
+        try:
+            import wandb
+            run_name = args.wandb_run_name if args.wandb_run_name else f"{args.exp}_fold{args.fold}"
+            wandb.init(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+                name=run_name,
+                config=vars(args),
+                resume="allow",
+                id=run_name
+            )
+            logging.info(f"[W&B] Initialized run '{run_name}' in project '{args.wandb_project}'")
+        except Exception as e:
+            logging.warning(f"[W&B] Failed to initialize W&B ({e}). Continuing training without W&B.")
+            args.use_wandb = False
+
+    if args.phase in ['all', 'pre_train']:
+        pre_train(pre_snapshot, val_dataset)
+    else:
+        logging.info(f"[PHASE] Skipping pre-training phase (--phase={args.phase})")
+
+    if args.phase in ['all', 'self_train']:
+        self_train(pre_snapshot, self_snapshot, val_dataset)
+    else:
+        logging.info(f"[PHASE] Skipping self-training phase (--phase={args.phase})")
+
+    if args.use_wandb:
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

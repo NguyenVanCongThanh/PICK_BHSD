@@ -325,24 +325,22 @@ class VNet_my(nn.Module):
 
 
     def mim_forward(self, input):
-        features = self.encoder(input)
-        out_mim, _ = self.mim_decoder(features)
-        
-        return out_mim
-
+        return self.forward(input, mode='mim')
 
     def aux_forward(self, input):
+        return self.forward(input, mode='aux')
+
+    def forward(self, input, mode='main'):
         features = self.encoder(input)
-        out_seg, _ = self.aux_decoder(features)
-
-        return out_seg
-        
-
-    def forward(self, input):
-        features = self.encoder(input)
-        out_seg, feat_de = self.main_decoder(features)
-
-        return features, out_seg, feat_de
+        if mode == 'mim':
+            out_mim, _ = self.mim_decoder(features)
+            return out_mim
+        elif mode == 'aux':
+            out_seg, _ = self.aux_decoder(features)
+            return out_seg
+        else:
+            out_seg, feat_de = self.main_decoder(features)
+            return features, out_seg, feat_de
 
 
 
